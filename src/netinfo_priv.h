@@ -12,6 +12,7 @@
 
 #include <wicked/types.h>
 #include <wicked/netinfo.h>
+#include <wicked/addrconf.h>
 #include <wicked/logging.h>
 #include <wicked/team.h>
 #include <wicked/ovs.h>
@@ -32,6 +33,7 @@ struct ni_event_filter {
 enum {
 	/* link details discover filter using external calls */
 	NI_NETCONFIG_DISCOVER_LINK_EXTERN = 1U << 0,
+	NI_NETCONFIG_DISCOVER_ROUTE_RULES = 1U << 1,
 };
 
 /*
@@ -202,5 +204,24 @@ struct ni_netdev_port_req {
 
 extern ni_netdev_port_req_t *	ni_netdev_port_req_new(ni_iftype_t);
 extern void			ni_netdev_port_req_free(ni_netdev_port_req_t *);
+
+typedef struct ni_addrconf_action	ni_addrconf_action_t;
+
+struct ni_addrconf_updater {
+	const ni_addrconf_action_t *	action;
+
+	ni_netdev_ref_t			device;
+	const ni_timer_t *		timer;
+
+	struct timeval			started;
+	unsigned int			timeout;
+	ni_int_range_t			jitter;
+	unsigned int			deadline;
+};
+
+extern ni_addrconf_updater_t *	ni_addrconf_updater_new_applying(ni_addrconf_lease_t *, const ni_netdev_t *);
+extern ni_addrconf_updater_t *	ni_addrconf_updater_new_removing(ni_addrconf_lease_t *, const ni_netdev_t *);
+extern int			ni_addrconf_updater_execute(ni_netdev_t *, ni_addrconf_lease_t *);
+extern void			ni_addrconf_updater_free(ni_addrconf_updater_t **);
 
 #endif /* __NETINFO_PRIV_H__ */

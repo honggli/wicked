@@ -153,8 +153,7 @@ ni_rtnl_query(struct ni_rtnl_query *q, unsigned int ifindex, unsigned int family
 	if (__ni_rtnl_query(&q->link_info, AF_UNSPEC, RTM_GETLINK) < 0
 	 || (family != AF_INET && __ni_rtnl_query(&q->ipv6_info, AF_INET6, RTM_GETLINK) < 0)
 	 || __ni_rtnl_query(&q->addr_info, family, RTM_GETADDR) < 0
-	 || __ni_rtnl_query(&q->route_info, family, RTM_GETROUTE) < 0
-	 || __ni_rtnl_query(&q->rule_info, family, RTM_GETRULE) < 0) {
+	 || __ni_rtnl_query(&q->route_info, family, RTM_GETROUTE) < 0) {
 		ni_rtnl_query_destroy(q);
 		return -1;
 	}
@@ -632,19 +631,6 @@ __ni_system_refresh_all(ni_netconfig_t *nc, ni_netdev_t **del_list)
 			ni_error("Problem parsing RTM_NEWROUTE message");
 	}
 
-	ni_netconfig_rules_reset_seq(nc);
-	while (1) {
-		struct fib_rule_hdr *frh;
-
-		if (!(frh = ni_rtnl_query_next_rule_info(&query, &h)))
-			break;
-
-		h->nlmsg_type = RTM_GETRULE; /* make refresh visible */
-		if (__ni_netdev_process_newrule(h, frh, nc) < 0)
-			ni_error("Problem parsing RTM_NEWRULE message");
-	}
-	ni_netconfig_rules_drop_by_seq(nc, seqno);
-
 	/* Cull any interfaces that went away */
 	tail = ni_netconfig_device_list_head(nc);
 	while ((dev = *tail) != NULL) {
@@ -665,6 +651,12 @@ __ni_system_refresh_all(ni_netconfig_t *nc, ni_netdev_t **del_list)
 			tail = &dev->next;
 		}
 	}
+
+	/* issue separate query ingnoring the error to not break
+	 * the bootstrap, e.g. when a kernel lacks rule support.
+	 */
+	if (!ni_netconfig_discover_filtered(nc, NI_NETCONFIG_DISCOVER_ROUTE_RULES))
+		(void)__ni_system_refresh_rules(nc);
 
 	res = 0;
 
@@ -742,19 +734,6 @@ __ni_system_refresh_interface(ni_netconfig_t *nc, ni_netdev_t *dev)
 			ni_error("Problem parsing RTM_NEWROUTE message");
 	}
 	ni_route_tables_drop_by_seq(nc, dev->routes, dev->seq);
-
-	ni_netconfig_rules_reset_seq(nc);
-	while (1) {
-		struct fib_rule_hdr *frh;
-
-		if (!(frh = ni_rtnl_query_next_rule_info(&query, &h)))
-			break;
-
-		h->nlmsg_type = RTM_GETRULE; /* make refresh visible */
-		if (__ni_netdev_process_newrule(h, frh, nc) < 0)
-			ni_error("Problem parsing RTM_NEWRULE message");
-	}
-	ni_netconfig_rules_drop_by_seq(nc, __ni_global_seqno);
 
 	res = 0;
 
@@ -1926,16 +1905,18 @@ __ni_discover_vlan(ni_netdev_t *dev, struct nlattr **tb, ni_netconfig_t *nc)
 	 * provide this.
 	 */
 	if (!tb[IFLA_LINKINFO]) {
-		ni_debug_ifconfig("%s: no extended linkinfo data provided",
-				dev ? dev->name : NULL);
-		return 0;
+		ni_debug_ifconfig("%s: no extended vlan linkinfo provided", dev->name);
+		return 1;
 	}
-
 	if (nla_parse_nested(link_info, IFLA_INFO_MAX, tb[IFLA_LINKINFO], NULL) < 0) {
-		ni_error("%s: unable to parse IFLA_LINKINFO", dev->name);
+		ni_error("%s: unable to parse vlan IFLA_LINKINFO", dev->name);
 		return -1;
 	}
 
+	if (!link_info[IFLA_INFO_DATA]) {
+		ni_debug_events("%s: no extended vlan linkinfo data provided", dev->name);
+		return 1;
+	}
 	if (nla_parse_nested(info_data, IFLA_VLAN_MAX, link_info[IFLA_INFO_DATA], NULL) < 0) {
 		ni_error("%s: unable to parse vlan IFLA_INFO_DATA", dev->name);
 		return -1;
@@ -1965,7 +1946,7 @@ int
 __ni_discover_macvlan(ni_netdev_t *dev, struct nlattr **tb, ni_netconfig_t *nc)
 {
 	struct nlattr *link_info[IFLA_INFO_MAX+1];
-	struct nlattr *info_data[IFLA_VLAN_MAX+1];
+	struct nlattr *info_data[IFLA_MACVLAN_MAX+1];
 	ni_macvlan_t *macvlan;
 
 	if (!dev || !tb || !(macvlan = ni_netdev_get_macvlan(dev))) {
@@ -1978,16 +1959,18 @@ __ni_discover_macvlan(ni_netdev_t *dev, struct nlattr **tb, ni_netconfig_t *nc)
 	 * provide this.
 	 */
 	if (!tb[IFLA_LINKINFO]) {
-		ni_debug_ifconfig("%s: no extended linkinfo data provided",
-				dev ? dev->name : NULL);
-		return 0;
+		ni_debug_ifconfig("%s: no extended macvlan linkinfo provided", dev->name);
+		return 1;
 	}
-
 	if (nla_parse_nested(link_info, IFLA_INFO_MAX, tb[IFLA_LINKINFO], NULL) < 0) {
-		ni_error("%s: unable to parse IFLA_LINKINFO", dev->name);
+		ni_error("%s: unable to parse macvlan IFLA_LINKINFO", dev->name);
 		return -1;
 	}
 
+	if (!link_info[IFLA_INFO_DATA]) {
+		ni_debug_events("%s: no extended vlan linkinfo data provided", dev->name);
+		return 1;
+	}
 	if (nla_parse_nested(info_data, IFLA_MACVLAN_MAX, link_info[IFLA_INFO_DATA], NULL) < 0) {
 		ni_error("%s: unable to parse macvlan IFLA_INFO_DATA", dev->name);
 		return -1;
@@ -2472,7 +2455,10 @@ __ni_rtnl_parse_newaddr(unsigned ifflags, struct nlmsghdr *h, struct ifaddrmsg *
 	ap->family	= ifa->ifa_family;
 	ap->prefixlen	= ifa->ifa_prefixlen;
 	ap->scope	= ifa->ifa_scope;
-	ap->flags	= ifa->ifa_flags;
+	if (tb[IFA_FLAGS])
+		ap->flags = nla_get_u32(tb[IFA_FLAGS]);
+	else
+		ap->flags = ifa->ifa_flags;
 
 	if (ni_log_level_at(NI_LOG_DEBUG3) && (ni_log_facility(NI_TRACE_EVENTS))) {
 		ni_trace("newaddr(%s): family %d, prefixlen %u, scope %u, flags %u",
@@ -2566,7 +2552,7 @@ __ni_netdev_process_newaddr_event(ni_netdev_t *dev, struct nlmsghdr *h, struct i
 	}
 
 #if 0
-	ni_debug_ifconfig("%s[%u]: address %s scope %s, flags%s%s%s%s%s%s%s%s [%02x], lft{%u,%u}, owned by %s",
+	ni_debug_ifconfig("%s[%u]: address %s scope %s, flags%s%s%s%s%s%s%s%s%s%s%s%s [%02x], lft{%u,%u}, owned by %s",
 			dev->name, dev->link.ifindex,
 			ni_sockaddr_print(&ap->local_addr),
 			(ap->scope == RT_SCOPE_HOST)? "host" :
@@ -2581,6 +2567,10 @@ __ni_netdev_process_newaddr_event(ni_netdev_t *dev, struct nlmsghdr *h, struct i
 			(ap->flags & IFA_F_OPTIMISTIC)?  " optimistic": "",
 			(ap->flags & IFA_F_HOMEADDRESS)? " home"      : "",
 			(ap->flags & IFA_F_NODAD)?       " nodad"     : "",
+			(ap->flags & IFA_F_MANAGETEMPADDR)	? " mngtmpaddr" : "",
+			(ap->flags & IFA_F_NOPREFIXROUTE)	? " noprefixroute" : "",
+			(ap->flags & IFA_F_MCAUTOJOIN)		? " mcautojoin" : "",
+			(ap->flags & IFA_F_STABLE_PRIVACY)	? " stable-privacy" : "",
 			(unsigned int)ap->flags,
 			ap->ipv6_cache_info.valid_lft,
 			ap->ipv6_cache_info.preferred_lft,
@@ -2920,7 +2910,9 @@ failure:
 int
 ni_rtnl_rule_parse_msg(struct nlmsghdr *h, struct fib_rule_hdr *frh, ni_rule_t *rule)
 {
-#define RULE_LOG_LEVEL		NI_LOG_DEBUG
+#ifndef RULE_LOG_LEVEL
+#define RULE_LOG_LEVEL		NI_LOG_DEBUG2
+#endif
 	struct nlattr *tb[FRA_MAX+1];
 	const char *prefix;
 	char *tmp = NULL;
