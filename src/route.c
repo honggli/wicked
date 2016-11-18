@@ -80,6 +80,7 @@ static const ni_intmap_t	ni_route_table_names[] = {
  */
 static const ni_intmap_t	ni_route_scope_names[] = {
 	{ "universe",		RT_SCOPE_UNIVERSE	},
+	{ "global",		RT_SCOPE_UNIVERSE	},
 	{ "site",		RT_SCOPE_SITE		},
 	{ "link",		RT_SCOPE_LINK		},
 	{ "host",		RT_SCOPE_HOST		},
@@ -2102,7 +2103,7 @@ ni_rule_equal(const ni_rule_t *r1, const ni_rule_t *r2)
 ni_bool_t
 ni_rule_equal_ref(const ni_rule_t *r1, const ni_rule_t *r2)
 {
-	return r1 == r1;
+	return r1 == r2;
 }
 
 ni_bool_t

@@ -76,6 +76,8 @@ typedef struct ni_compat_netdev {
 
 		unsigned int	route_priority;
 		unsigned int	update;
+
+		ni_string_array_t request_options;
 	} dhcp4;
 	struct {
 		ni_bool_t	enabled;
@@ -100,10 +102,13 @@ typedef struct ni_compat_netdev {
 		ni_bool_t	release_lease;
 
 		unsigned int	update;
+
+		ni_string_array_t request_options;
 	} dhcp6;
 	struct {
 		ni_bool_t	enabled;
 		unsigned int    defer_timeout;
+		unsigned int	update;
 	} auto6;
 } ni_compat_netdev_t;
 

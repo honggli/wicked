@@ -130,6 +130,8 @@ ni_compat_netdev_new(const char *ifname)
 	compat->dhcp6.recover_lease = TRUE;
 	compat->dhcp6.release_lease = FALSE;
 
+	compat->auto6.update = ni_config_addrconf_update_mask(NI_ADDRCONF_AUTOCONF, AF_INET6);
+
 	return compat;
 }
 
@@ -180,9 +182,11 @@ ni_compat_netdev_free(ni_compat_netdev_t *compat)
 		ni_string_free(&compat->dhcp4.client_id);
 		ni_string_free(&compat->dhcp4.vendor_class);
 		ni_string_array_destroy(&compat->dhcp4.user_class.class_id);
+		ni_string_array_destroy(&compat->dhcp4.request_options);
 
 		ni_string_free(&compat->dhcp6.hostname);
 		ni_string_free(&compat->dhcp6.client_id);
+		ni_string_array_destroy(&compat->dhcp6.request_options);
 
 		free(compat);
 	}
@@ -1818,6 +1822,7 @@ __ni_compat_generate_static_address_list(xml_node_t *afnode, ni_address_t *addr_
 {
 	ni_address_t *ap;
 	xml_node_t *anode;
+	const char *ptr;
 
 	for (ap = addr_list; ap; ap = ap->next) {
 		if (ap->family != af)
@@ -1832,6 +1837,27 @@ __ni_compat_generate_static_address_list(xml_node_t *afnode, ni_address_t *addr_
 			xml_node_new_element("broadcast", anode, ni_sockaddr_print(&ap->bcast_addr));
 		if (af == AF_INET && ap->label)
 			xml_node_new_element("label", anode, ap->label);
+
+		if (ap->scope >= 0 && (ptr = ni_route_scope_type_to_name(ap->scope)))
+			xml_node_new_element("scope", anode, ptr);
+
+		if (ap->flags)
+			xml_node_new_element_uint("flags", anode, ap->flags);
+
+		/* We are applying static address, but at least valid_lft = infinite,
+		 * preferred_lft = 0 is a valid case to apply deprecated addresses...
+		 * A valid_lft = preferred_lft = 0 means unspecified / omit lifetimes.
+		 */
+		if (ap->ipv6_cache_info.valid_lft &&
+		    ap->ipv6_cache_info.preferred_lft != NI_LIFETIME_INFINITE) {
+			xml_node_t *cache_info = xml_node_new("cache-info", anode);
+			if (cache_info) {
+				xml_node_new_element_uint("valid-lifetime", cache_info,
+							ap->ipv6_cache_info.valid_lft);
+				xml_node_new_element_uint("preferred-lifetime", cache_info,
+							ap->ipv6_cache_info.preferred_lft);
+			}
+		}
 	}
 }
 
@@ -1959,6 +1985,22 @@ __ni_compat_generate_dhcp4_addrconf(xml_node_t *ifnode, const ni_compat_netdev_t
 		__ni_compat_generate_dhcp4_user_class(dhcp, &compat->dhcp4.user_class);
 	}
 
+	if (compat->dhcp4.request_options.count) {
+		xml_node_t *req;
+		unsigned int i;
+
+		req = xml_node_new("request-options", NULL);
+		for (i = 0; req && i < compat->dhcp4.request_options.count; ++i) {
+			const char *opt = compat->dhcp4.request_options.data[i];
+			xml_node_new_element("option", req, opt);
+		}
+		if (req->children) {
+			xml_node_add_child(dhcp, req);
+		} else {
+			xml_node_free(req);
+		}
+	}
+
 	return dhcp;
 }
 
@@ -2023,6 +2065,23 @@ __ni_compat_generate_dhcp6_addrconf(xml_node_t *ifnode, const ni_compat_netdev_t
 	if (compat->dhcp6.vendor_class)
 		xml_node_dict_set(dhcp, "vendor-class", compat->dhcp6.vendor_class);
 #endif
+
+	if (compat->dhcp6.request_options.count) {
+		xml_node_t *req;
+		unsigned int i;
+
+		req = xml_node_new("request-options", NULL);
+		for (i = 0; req && i < compat->dhcp6.request_options.count; ++i) {
+			const char *opt = compat->dhcp6.request_options.data[i];
+			xml_node_new_element("option", req, opt);
+		}
+		if (req->children) {
+			xml_node_add_child(dhcp, req);
+		} else {
+			xml_node_free(req);
+		}
+	}
+
 	return dhcp;
 }
 
@@ -2034,7 +2093,7 @@ __ni_compat_generate_auto6_addrconf(xml_node_t *ifnode, const ni_compat_netdev_t
 	if (!compat->auto6.enabled)
 		return NULL;
 
-	aconf = __ni_compat_generate_dynamic_addrconf(ifnode, "ipv6:auto", 0, 0);
+	aconf = __ni_compat_generate_dynamic_addrconf(ifnode, "ipv6:auto", 0, compat->auto6.update);
 
 	if (aconf && compat->auto6.defer_timeout != -1U) {
 		xml_node_dict_set(aconf, "defer-timeout",

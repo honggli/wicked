@@ -84,6 +84,7 @@ extern int		__ni_system_refresh_interfaces(ni_netconfig_t *nc);
 extern int		__ni_system_refresh_interface(ni_netconfig_t *, ni_netdev_t *);
 extern int		__ni_system_refresh_interface_addrs(ni_netconfig_t *, ni_netdev_t *);
 extern int		__ni_system_refresh_interface_routes(ni_netconfig_t *, ni_netdev_t *);
+extern int		__ni_system_refresh_addrs(ni_netconfig_t *, unsigned int);
 extern int		__ni_system_refresh_routes(ni_netconfig_t *);
 extern int		__ni_system_refresh_rules(ni_netconfig_t *);
 extern int		__ni_device_refresh_link_info(ni_netconfig_t *, ni_linkinfo_t *);
@@ -97,7 +98,7 @@ extern void		__ni_system_ethernet_refresh(ni_netdev_t *);
 extern void		__ni_system_ethernet_update(ni_netdev_t *, ni_ethernet_t *);
 
 /* FIXME: These should go elsewhere, maybe runtime.h */
-extern int		__ni_system_interface_update_lease(ni_netdev_t *, ni_addrconf_lease_t **);
+extern int		__ni_system_interface_update_lease(ni_netdev_t *, ni_addrconf_lease_t **, ni_event_t);
 
 /* FIXME: These should go elsewhere, maybe runtime.h */
 extern int		__ni_system_hostname_put(const char *);
@@ -150,7 +151,9 @@ typedef struct ni_capture_protinfo {
 extern int		ni_capture_devinfo_init(ni_capture_devinfo_t *, const char *, const ni_linkinfo_t *);
 extern int		ni_capture_devinfo_refresh(ni_capture_devinfo_t *, const char *, const ni_linkinfo_t *);
 extern ni_capture_t *	ni_capture_open(const ni_capture_devinfo_t *, const ni_capture_protinfo_t *, void (*)(ni_socket_t *));
-extern int		ni_capture_recv(ni_capture_t *, ni_buffer_t *);
+extern int		ni_capture_recv(ni_capture_t *, ni_buffer_t *, ni_sockaddr_t *, const char *);
+extern ni_bool_t	ni_capture_from_hwaddr_set(ni_hwaddr_t *, const ni_sockaddr_t *);
+extern const char *	ni_capture_from_hwaddr_print(const ni_sockaddr_t *);
 extern ssize_t		ni_capture_send(ni_capture_t *, const ni_buffer_t *, const ni_timeout_param_t *);
 extern void		ni_capture_disarm_retransmit(ni_capture_t *);
 extern void		ni_capture_force_retransmit(ni_capture_t *, unsigned int);
@@ -206,22 +209,31 @@ extern ni_netdev_port_req_t *	ni_netdev_port_req_new(ni_iftype_t);
 extern void			ni_netdev_port_req_free(ni_netdev_port_req_t *);
 
 typedef struct ni_addrconf_action	ni_addrconf_action_t;
+typedef void				ni_addrconf_updater_cleanup_t(void *);
 
 struct ni_addrconf_updater {
 	const ni_addrconf_action_t *	action;
+	struct timeval			astart;		/* action  */
 
 	ni_netdev_ref_t			device;
-	const ni_timer_t *		timer;
+	ni_event_t			event;
 
-	struct timeval			started;
-	unsigned int			timeout;
+	const ni_timer_t *		timer;
 	ni_int_range_t			jitter;
+	unsigned int			timeout;
+	struct timeval			started;	/* updater */
 	unsigned int			deadline;
+
+	ni_addrconf_updater_cleanup_t *	cleanup;
+	void *				user_data;
 };
 
-extern ni_addrconf_updater_t *	ni_addrconf_updater_new_applying(ni_addrconf_lease_t *, const ni_netdev_t *);
-extern ni_addrconf_updater_t *	ni_addrconf_updater_new_removing(ni_addrconf_lease_t *, const ni_netdev_t *);
+extern ni_addrconf_updater_t *	ni_addrconf_updater_new_applying(ni_addrconf_lease_t *, const ni_netdev_t *, ni_event_t);
+extern ni_addrconf_updater_t *	ni_addrconf_updater_new_removing(ni_addrconf_lease_t *, const ni_netdev_t *, ni_event_t);
+extern ni_bool_t		ni_addrconf_updater_background(ni_addrconf_updater_t *, unsigned int);
 extern int			ni_addrconf_updater_execute(ni_netdev_t *, ni_addrconf_lease_t *);
+extern void			ni_addrconf_updater_set_data(ni_addrconf_updater_t *, void *, ni_addrconf_updater_cleanup_t *);
+extern void *			ni_addrconf_updater_get_data(ni_addrconf_updater_t *, ni_addrconf_updater_cleanup_t *);
 extern void			ni_addrconf_updater_free(ni_addrconf_updater_t **);
 
 #endif /* __NETINFO_PRIV_H__ */

@@ -359,18 +359,21 @@ ni_uint_array_destroy(ni_uint_array_t *nua)
 	}
 }
 
-static void
-__ni_uint_array_realloc(ni_uint_array_t *nua, unsigned int newsize)
+static ni_bool_t
+ni_uint_array_realloc(ni_uint_array_t *nua, unsigned int newsize)
 {
 	unsigned int *newdata, i;
 
 	newsize = newsize + NI_UINT_ARRAY_CHUNK;
 	newdata = realloc(nua->data, newsize * sizeof(unsigned int));
+	if (!newdata)
+		return FALSE;
 
 	nua->data = newdata;
 	for (i = nua->count; i < newsize; ++i) {
 		nua->data[i] = 0;
 	}
+	return TRUE;
 }
 
 ni_bool_t
@@ -379,11 +382,48 @@ ni_uint_array_append(ni_uint_array_t *nua, unsigned int num)
 	if (!nua)
 		return FALSE;
 
-	if ((nua->count % NI_UINT_ARRAY_CHUNK) == 0)
-		__ni_uint_array_realloc(nua, nua->count);
+	if ((nua->count % NI_UINT_ARRAY_CHUNK) == 0 &&
+	    !ni_uint_array_realloc(nua, nua->count))
+		return FALSE;
 
 	nua->data[nua->count++] = num;
 	return TRUE;
+}
+
+ni_bool_t
+ni_uint_array_remove_at(ni_uint_array_t *nua, unsigned int index)
+{
+	if(!nua || index >= nua->count)
+		return FALSE;
+
+	nua->count--;
+	if (index < nua->count) {
+		memmove(&nua->data[index], &nua->data[index + 1],
+			(nua->count - index) * sizeof(unsigned int));
+	}
+	nua->data[nua->count] = 0;
+
+	return TRUE;
+}
+
+ni_bool_t
+ni_uint_array_remove(ni_uint_array_t *nua, unsigned int num)
+{
+	return ni_uint_array_remove_at(nua, ni_uint_array_index(nua, num));
+}
+
+unsigned int
+ni_uint_array_index(ni_uint_array_t *nua, unsigned int num)
+{
+	unsigned int i;
+
+	if (nua) {
+		for (i = 0; i < nua->count; ++i) {
+			if (num == nua->data[i])
+				return i;
+		}
+	}
+	return -1U;
 }
 
 ni_bool_t
@@ -398,6 +438,26 @@ ni_uint_array_contains(ni_uint_array_t *nua, unsigned int num)
 		}
 	}
 	return FALSE;
+}
+
+ni_bool_t
+ni_uint_array_get(ni_uint_array_t *nua, unsigned int index, unsigned int *num)
+{
+	if (!num || !nua || index >= nua->count)
+		return FALSE;
+
+	*num = nua->data[index];
+	return TRUE;
+}
+
+ni_bool_t
+ni_uint_array_set(ni_uint_array_t *nua, unsigned int index, unsigned int num)
+{
+	if (!nua || index >= nua->count)
+		return FALSE;
+
+	nua->data[index] = num;
+	return TRUE;
 }
 
 /*
@@ -1127,13 +1187,13 @@ ni_sprint_hex(const unsigned char *data, size_t len)
 		return NULL;
 
 	hex_len = (len << 1) + len + 1;
+	buffer = (char *) malloc(hex_len);
 
-	buffer = (char *) xmalloc(hex_len);
+	if (ni_format_hex(data, len, buffer, hex_len))
+		return buffer;
 
-	if (!ni_format_hex(data, len, buffer, hex_len))
-		return NULL;
-
-	return buffer;
+	free(buffer);
+	return NULL;
 }
 
 const char *
@@ -1541,8 +1601,12 @@ ni_format_hex(const unsigned char *data, unsigned int datalen, char *namebuf, si
 {
 	unsigned int i, j;
 
+	if (!data || !namebuf || !namelen)
+		return NULL;
+
+	namebuf[0] = '\0';
 	for (i = j = 0; i < datalen; ++i) {
-		if (j + 4 >= namelen)
+		if (j + 3 >= namelen)
 			break;
 		if (i)
 			namebuf[j++] = ':';
@@ -1557,7 +1621,6 @@ ni_print_hex(const unsigned char *data, unsigned int datalen)
 {
 	static char addrbuf[512]; /* >= ni_opaque_t data * 3 */
 
-	addrbuf[0] = '\0';
 	return ni_format_hex(data, datalen, addrbuf, sizeof(addrbuf));
 }
 
@@ -2656,6 +2719,12 @@ xstrdup(const char *string)
 	return p;
 }
 
+ni_bool_t
+ni_uint_in_range(const ni_uint_range_t *range, const unsigned int value)
+{
+	return range ? value >= range->min && value <= range->max : FALSE;
+}
+
 /*
  * ni_opaque_t encapsulates a (small) chunk of binary data
  */
@@ -2888,9 +2957,10 @@ ni_check_domain_name(const char *ptr, size_t len, int dots)
 				return FALSE;
 		} else if ( *p == '.') {
 			/* each label has to be 1-63 characters;
-			   we allow [.] at the end ('foo.bar.')   */
+			   we allow [.] at the end ('foo.bar.'),
+			   but do not count it                    */
 			ssize_t d = (ssize_t)(p - ptr);
-			if( d <= 0 || d >= 64)
+			if( d <= 0 || d >= 64 || dots < 0)
 				return FALSE;
 			ptr = p + 1; /* jump to the next label    */
 			if(dots > 0 && len > 0)
@@ -2900,7 +2970,7 @@ ni_check_domain_name(const char *ptr, size_t len, int dots)
 			return FALSE;
 		}
 	}
-	return dots ? FALSE : TRUE;
+	return dots > 0 ? FALSE : TRUE;
 }
 
 ni_bool_t

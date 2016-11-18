@@ -154,6 +154,8 @@ struct ni_dhcp4_request {
 	char *			hostname;
 	unsigned int		route_priority;
 
+	ni_string_array_t	request_options;
+
 	/* Options what to update based on the info received from
 	 * the DHCP4 server.
 	 * This is a bitmap; individual bits correspond to
@@ -188,6 +190,7 @@ struct ni_dhcp4_config {
 	/* A combination of DHCP4_DO_* flags above */
 	unsigned int		update;
 	unsigned int		doflags;
+	ni_uint_array_t		request_options;
 
 	unsigned int		route_priority;
 
@@ -215,9 +218,10 @@ extern int		ni_dhcp4_acquire(ni_dhcp4_device_t *, const ni_dhcp4_request_t *);
 extern int		ni_dhcp4_release(ni_dhcp4_device_t *, const ni_uuid_t *);
 extern void		ni_dhcp4_restart_leases(void);
 
+extern const char *	ni_dhcp4_fsm_state_name(enum fsm_state);
 extern void		ni_dhcp4_fsm_init_device(ni_dhcp4_device_t *);
-extern void		ni_dhcp4_fsm_release(ni_dhcp4_device_t *);
-extern int		ni_dhcp4_fsm_process_dhcp4_packet(ni_dhcp4_device_t *, ni_buffer_t *);
+extern void		ni_dhcp4_fsm_release_init(ni_dhcp4_device_t *);
+extern int		ni_dhcp4_fsm_process_dhcp4_packet(ni_dhcp4_device_t *, ni_buffer_t *, ni_sockaddr_t *);
 extern int		ni_dhcp4_fsm_commit_lease(ni_dhcp4_device_t *, ni_addrconf_lease_t *);
 extern int		ni_dhcp4_recover_lease(ni_dhcp4_device_t *);
 extern int		ni_dhcp4_build_message(const ni_dhcp4_device_t *,
@@ -255,6 +259,7 @@ extern void		ni_dhcp4_device_force_retransmit(ni_dhcp4_device_t *, unsigned int)
 extern void		ni_dhcp4_device_arp_close(ni_dhcp4_device_t *);
 extern ni_bool_t	ni_dhcp4_parse_client_id(ni_opaque_t *, unsigned short, const char *);
 extern ni_bool_t	ni_dhcp4_set_client_id(ni_opaque_t *, const ni_hwaddr_t *);
+extern void		ni_dhcp4_new_xid(ni_dhcp4_device_t *);
 extern void		ni_dhcp4_device_set_best_offer(ni_dhcp4_device_t *, ni_addrconf_lease_t *, int);
 extern void		ni_dhcp4_device_drop_best_offer(ni_dhcp4_device_t *);
 
@@ -262,9 +267,10 @@ extern int		ni_dhcp4_xml_from_lease(const ni_addrconf_lease_t *, xml_node_t *);
 extern int		ni_dhcp4_xml_to_lease(ni_addrconf_lease_t *, const xml_node_t *);
 
 extern const char *	ni_dhcp4_config_vendor_class(void);
-extern int		ni_dhcp4_config_ignore_server(struct in_addr);
+extern int		ni_dhcp4_config_ignore_server(const char *);
 extern int		ni_dhcp4_config_have_server_preference(void);
-extern int		ni_dhcp4_config_server_preference(struct in_addr);
+extern int		ni_dhcp4_config_server_preference_ipaddr(struct in_addr);
+extern int		ni_dhcp4_config_server_preference_hwaddr(const ni_hwaddr_t *);
 extern unsigned int	ni_dhcp4_config_max_lease_time(void);
 extern void		ni_dhcp4_config_free(ni_dhcp4_config_t *);
 

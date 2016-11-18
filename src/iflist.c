@@ -746,6 +746,55 @@ failed:
  * Refresh addresses
  */
 int
+__ni_system_refresh_addrs(ni_netconfig_t *nc, unsigned int family)
+{
+	struct ni_rtnl_query query;
+	struct nlmsghdr *h;
+	unsigned int seqno;
+	ni_netdev_t *dev;
+	int res = -1;
+
+	ni_debug_verbose(NI_LOG_DEBUG1, NI_TRACE_EVENTS,
+			"Refresh of all %s%saddresses",
+			family == AF_UNSPEC ? "" :
+			ni_addrfamily_type_to_name(family),
+			family == AF_UNSPEC ? "" : " ");
+	do {
+		seqno = ++__ni_global_seqno;
+	} while (!seqno);
+
+	if (ni_rtnl_query_addr_info(&query, 0, family) < 0)
+		goto failed;
+
+	for (dev = ni_netconfig_devlist(nc); dev; dev = dev->next) {
+		ni_address_list_reset_seq(dev->addrs);
+		dev->seq = seqno;
+	}
+
+	while (1) {
+		struct ifaddrmsg *ifa;
+
+		if (!(ifa = ni_rtnl_query_next_addr_info(&query, &h)))
+			break;
+
+		if ((dev = ni_netdev_by_index(nc, ifa->ifa_index)) == NULL)
+			continue;
+
+		if (__ni_netdev_process_newaddr(dev, h, ifa) < 0)
+			ni_error("Problem parsing RTM_NEWADDR message for %s", dev->name);
+	}
+
+	for (dev = ni_netconfig_devlist(nc); dev; dev = dev->next)
+		ni_address_list_drop_by_seq(&dev->addrs, seqno);
+
+	res = 0;
+
+failed:
+	ni_rtnl_query_destroy(&query);
+	return res;
+}
+
+int
 __ni_system_refresh_interface_addrs(ni_netconfig_t *nc, ni_netdev_t *dev)
 {
 	struct ni_rtnl_query query;
@@ -753,7 +802,7 @@ __ni_system_refresh_interface_addrs(ni_netconfig_t *nc, ni_netdev_t *dev)
 	int res = -1;
 
 	ni_debug_verbose(NI_LOG_DEBUG1, NI_TRACE_EVENTS,
-			"Refresh of %s interface address",
+			"Refresh of %s interface addresses",
 			dev->name);
 
 	do {
@@ -1047,7 +1096,30 @@ __ni_netdev_translate_ifflags(unsigned int ifflags, unsigned int prev)
 }
 
 static void
-__ni_process_ifinfomsg_linktype(ni_linkinfo_t *link, const char *ifname)
+__ni_process_ifinfomsg_ovs_type(ni_iftype_t *type, const char *ifname, ni_netconfig_t *nc)
+{
+	static const char *ovs_system = NULL;
+
+	/* special, reserved openvswitch datapath device name */
+	if (ovs_system == NULL)
+		ovs_system = ni_linktype_type_to_name(NI_IFTYPE_OVS_SYSTEM);
+
+	if (ni_string_eq(ifname, ovs_system))
+		*type = NI_IFTYPE_OVS_SYSTEM;
+
+	/* we don't know whether this is really a bridge or some
+	 * other ovs device until we were able to query ovs about.
+	 * Until then, it is an unspecified ovs device.
+	 */
+	if (ni_netconfig_discover_filtered(nc, NI_NETCONFIG_DISCOVER_LINK_EXTERN))
+		return;
+
+	if (ni_ovs_vsctl_bridge_exists(ifname) == 0)
+		*type = NI_IFTYPE_OVS_BRIDGE;
+}
+
+static void
+__ni_process_ifinfomsg_linktype(ni_linkinfo_t *link, const char *ifname, ni_netconfig_t *nc)
 {
 	ni_iftype_t tmp_link_type = NI_IFTYPE_UNKNOWN;
 	struct ethtool_drvinfo drv_info;
@@ -1067,6 +1139,10 @@ __ni_process_ifinfomsg_linktype(ni_linkinfo_t *link, const char *ifname)
 		 */
 		if (link->hwaddr.type == ARPHRD_ETHER)
 			tmp_link_type = NI_IFTYPE_TAP;
+		break;
+
+	case NI_IFTYPE_OVS_UNSPEC:
+		__ni_process_ifinfomsg_ovs_type(&tmp_link_type, ifname, nc);
 		break;
 
 	case NI_IFTYPE_UNKNOWN:
@@ -1102,15 +1178,8 @@ __ni_process_ifinfomsg_linktype(ni_linkinfo_t *link, const char *ifname)
 				} else if (!strcmp(driver, "802.1Q VLAN Support")) {
 					tmp_link_type = NI_IFTYPE_VLAN;
 				} else if (!strcmp(driver, "openvswitch")) {
-					static const char *ovs_system = NULL;
-
-					/* special openvswitch datapath (master) device */
-					if (ovs_system == NULL)
-						ovs_system = ni_linktype_type_to_name(NI_IFTYPE_OVS_SYSTEM);
-					if (ni_string_eq(ifname, ovs_system))
-						tmp_link_type = NI_IFTYPE_OVS_SYSTEM;
-					else
-						tmp_link_type = NI_IFTYPE_OVS_BRIDGE;
+					tmp_link_type = NI_IFTYPE_OVS_UNSPEC;
+					__ni_process_ifinfomsg_ovs_type(&tmp_link_type, ifname, nc);
 				}
 			}
 			break;
@@ -1181,8 +1250,8 @@ __ni_process_ifinfomsg_linktype(ni_linkinfo_t *link, const char *ifname)
 			link->type = tmp_link_type;
 		}
 	} else
-	if (link->type != tmp_link_type) {
-		/* We're trying to re-assign a link type, Disallow. */
+	if (link->type != tmp_link_type && tmp_link_type != NI_IFTYPE_OVS_UNSPEC) {
+		/* We're trying to re-assign a link type, complain. */
 		ni_error("%s: Ignoring attempt to reset existing interface link type from %s to %s",
 			ifname, ni_linktype_type_to_name(link->type),
 			ni_linktype_type_to_name(tmp_link_type));
@@ -1548,7 +1617,7 @@ __ni_process_ifinfomsg_linkinfo(ni_linkinfo_t *link, const char *ifname,
 	}
 
 	/* Attempt to determine linktype. */
-	__ni_process_ifinfomsg_linktype(link, ifname);
+	__ni_process_ifinfomsg_linktype(link, ifname, nc);
 
 	return 0;
 }

@@ -70,6 +70,7 @@
 #include "appconfig.h"
 #include "util_priv.h"
 #include "duid.h"
+#include "dhcp.h"
 #include "client/suse/ifsysctl.h"
 #include "client/wicked-client.h"
 
@@ -1609,7 +1610,9 @@ __ni_suse_startmode(const ni_sysconfig_t *sc)
 			ni_sysconfig_get_integer(sc, "IFPLUGD_PRIORITY", &control->link_priority);
 		}
 
-		if ((value = ni_sysconfig_get_value(sc, "LINK_REQUIRED"))) {
+		if (!(value = ni_sysconfig_get_value(sc, "LINK_REQUIRED")))
+			value = ni_sysconfig_get_value(__ni_suse_config_defaults, "LINK_REQUIRED");
+		if (value) {
 			/* otherwise assume "auto" */
 			if (ni_string_eq(value, "yes"))
 				ni_tristate_set(&control->link_required, TRUE);
@@ -4199,6 +4202,74 @@ try_tunnel(const ni_sysconfig_t *sc, ni_compat_netdev_t *compat)
  *   REMOTE_IPADDR_x
  */
 static ni_bool_t
+__get_ipaddr_lft(const char *val, unsigned int *lft)
+{
+	if (ni_string_eq(val, "forever") || ni_string_eq(val, "infinite"))
+		*lft = NI_LIFETIME_INFINITE;
+	else
+	if (!ni_parse_uint(val, lft, 0))
+		return FALSE;
+	return TRUE;
+}
+
+static ni_bool_t
+__get_ipaddr_opts(const char *value, ni_address_t *ap)
+{
+	ni_string_array_t opts = NI_STRING_ARRAY_INIT;
+	unsigned int valid_lft = NI_LIFETIME_INFINITE;
+	unsigned int preferred_lft = NI_LIFETIME_INFINITE;
+	const char *opt, *val;
+	unsigned int pos = 0;
+	ni_bool_t ret = TRUE;
+
+	/*
+	 * All about ipv6 -- anything useful to consider for ipv4?
+	 */
+	if (ap->family != AF_INET6)
+		return TRUE;
+
+	ni_string_split(&opts, value, " \t", 0);
+
+	while ((opt = ni_string_array_at(&opts, pos++))) {
+		if (ni_string_eq(opt, "valid_lft")) {
+			val = ni_string_array_at(&opts, pos++);
+			if (!__get_ipaddr_lft(val, &valid_lft))
+				ret = FALSE;
+		}
+		else
+		if (ni_string_eq(opt, "preferred_lft")) {
+			val = ni_string_array_at(&opts, pos++);
+			if (!__get_ipaddr_lft(val, &preferred_lft))
+				ret = FALSE;
+		}
+		else
+		if (ni_string_eq(opt, "nodad"))
+			ap->flags |= IFA_F_NODAD;
+		else
+		if (ni_string_eq(opt, "noprefixroute"))
+			ap->flags |= IFA_F_NOPREFIXROUTE;
+		else
+		if (ni_string_eq(opt, "autojoin"))
+			ap->flags |= IFA_F_MCAUTOJOIN;
+		else
+		if (ni_string_eq(opt, "home") || ni_string_eq(opt, "homeaddress"))
+			ap->flags |= IFA_F_HOMEADDRESS;
+		else
+			ret = FALSE;
+	}
+
+	if (preferred_lft > valid_lft)
+		preferred_lft = valid_lft;
+
+	if (preferred_lft != NI_LIFETIME_INFINITE) {
+		ap->ipv6_cache_info.valid_lft = valid_lft;
+		ap->ipv6_cache_info.preferred_lft = preferred_lft;
+	}
+
+	return ret;
+}
+
+static ni_bool_t
 __get_ipaddr(const ni_sysconfig_t *sc, const char *ifname, const char *suffix, ni_address_t **list)
 {
 	ni_var_t *var;
@@ -4281,6 +4352,25 @@ __get_ipaddr(const ni_sysconfig_t *sc, const char *ifname, const char *suffix, n
 			} else {
 				ni_string_dup(&ap->label, var->value);
 			}
+		}
+	}
+
+	var = __find_indexed_variable(sc, "SCOPE", suffix);
+	if (var && !ni_string_empty(var->value)) {
+		unsigned int scope;
+		if (!ni_route_scope_name_to_type(var->value, &scope)) {
+			ni_info("ifcfg-%s: ignoring %s='%s' unknown scope",
+					ifname, var->name, var->value);
+		} else {
+			ap->scope = scope;
+		}
+	}
+
+	var = __find_indexed_variable(sc, "IP_OPTIONS", suffix);
+	if (var && !ni_string_empty(var->value)) {
+		if (!__get_ipaddr_opts(var->value, ap)) {
+			ni_info("ifcfg-%s: %s='%s' contains unsupported options",
+					ifname, var->name, var->value);
 		}
 	}
 
@@ -4539,11 +4629,56 @@ __ni_suse_parse_dhcp4_user_class(const ni_sysconfig_t *sc, ni_compat_netdev_t *c
 	return TRUE;
 }
 
+static void
+__ni_suse_parse_dhcp_req_options(const ni_sysconfig_t *sc, ni_string_array_t *options,
+				const char *prefix, const ni_dhcp_option_decl_t *custom,
+				unsigned int code_min, unsigned int code_max)
+{
+	ni_string_array_t vars = NI_STRING_ARRAY_INIT;
+	ni_string_array_t opts = NI_STRING_ARRAY_INIT;
+	const char *value;
+	unsigned int i, j;
+	unsigned int code;
+
+	ni_sysconfig_find_matching(sc, prefix, &vars);
+	for (i = 0; i < vars.count; ++i) {
+		value = ni_sysconfig_get_value(sc, vars.data[i]);
+		ni_string_split(&opts, value, " ", 0);
+		for (j = 0; j < opts.count; ++j) {
+			const ni_dhcp_option_decl_t *decl;
+			const char *opt = opts.data[j];
+
+			if ((decl = ni_dhcp_option_decl_list_find_by_name(custom, opt)))
+				opt = decl->name;
+			else
+			if (ni_parse_uint(opt, &code, 10)) {
+				ni_warn("%s: Cannot parse %s option code '%s'",
+						ni_basename(sc->pathname), vars.data[i],
+						opt);
+				continue;
+			} else
+			if (code < code_min || code_max < code) {
+				ni_warn("%s: %s option code %u is out of range (%u..%u)",
+						ni_basename(sc->pathname), vars.data[i],
+						code, code_min, code_max);
+				continue;
+			} else
+			if ((decl = ni_dhcp_option_decl_list_find_by_code(custom, code)))
+				opt = decl->name;
+
+			ni_string_array_append(options, opt);
+		}
+		ni_string_array_destroy(&opts);
+	}
+	ni_string_array_destroy(&vars);
+}
+
 /*
  * Process DHCPv4 addrconf
  */
 static ni_bool_t
-__ni_suse_addrconf_dhcp4_options(const ni_sysconfig_t *sc, ni_compat_netdev_t *compat)
+__ni_suse_addrconf_dhcp4_options(const ni_sysconfig_t *sc, ni_compat_netdev_t *compat,
+				const ni_config_dhcp4_t *config)
 {
 	const char *string;
 	unsigned int uint;
@@ -4625,6 +4760,9 @@ __ni_suse_addrconf_dhcp4_options(const ni_sysconfig_t *sc, ni_compat_netdev_t *c
 		}
 	}
 
+	__ni_suse_parse_dhcp_req_options(sc, &compat->dhcp4.request_options,
+					"DHCLIENT_REQUEST_OPTION", config ?
+					config->custom_options : NULL, 1, 254);
 	return ret;
 }
 
@@ -4632,7 +4770,8 @@ __ni_suse_addrconf_dhcp4_options(const ni_sysconfig_t *sc, ni_compat_netdev_t *c
  * Process DHCPv6 addrconf
  */
 static ni_bool_t
-__ni_suse_addrconf_dhcp6_options(const ni_sysconfig_t *sc, ni_compat_netdev_t *compat)
+__ni_suse_addrconf_dhcp6_options(const ni_sysconfig_t *sc, ni_compat_netdev_t *compat,
+				const ni_config_dhcp6_t *config)
 {
 	ni_bool_t ret = TRUE;
 	unsigned int uint;
@@ -4711,12 +4850,17 @@ __ni_suse_addrconf_dhcp6_options(const ni_sysconfig_t *sc, ni_compat_netdev_t *c
 		}
 	}
 
+	__ni_suse_parse_dhcp_req_options(sc, &compat->dhcp6.request_options,
+					"DHCLIENT6_REQUEST_OPTION", config ?
+					config->custom_options : NULL, 1, 65534);
+
 	return ret;
 }
 
 static ni_bool_t
 __ni_suse_addrconf_dhcp4(const ni_sysconfig_t *sc, ni_compat_netdev_t *compat, ni_bool_t required)
 {
+	const ni_config_dhcp4_t *config = NULL;
 	ni_netdev_t *dev = compat->dev;
 	ni_sysconfig_t *merged;
 
@@ -4733,8 +4877,9 @@ __ni_suse_addrconf_dhcp4(const ni_sysconfig_t *sc, ni_compat_netdev_t *compat, n
 	compat->dhcp4.recover_lease = TRUE;
 	compat->dhcp4.release_lease = FALSE;
 
+	config = ni_config_dhcp4_find_device(dev->name);
 	if ((merged = ni_sysconfig_merge_defaults(sc, __ni_suse_dhcp_defaults))) {
-		__ni_suse_addrconf_dhcp4_options(merged, compat);
+		__ni_suse_addrconf_dhcp4_options(merged, compat, config);
 		ni_sysconfig_destroy(merged);
 	}
 
@@ -4746,6 +4891,7 @@ __ni_suse_addrconf_dhcp4(const ni_sysconfig_t *sc, ni_compat_netdev_t *compat, n
 static ni_bool_t
 __ni_suse_addrconf_dhcp6(const ni_sysconfig_t *sc, ni_compat_netdev_t *compat, ni_bool_t required)
 {
+	const ni_config_dhcp6_t *config = NULL;
 	ni_netdev_t *dev = compat->dev;
 	ni_sysconfig_t *merged;
 
@@ -4760,8 +4906,9 @@ __ni_suse_addrconf_dhcp6(const ni_sysconfig_t *sc, ni_compat_netdev_t *compat, n
 	compat->dhcp6.recover_lease = TRUE;
 	compat->dhcp6.release_lease = FALSE;
 
+	config = ni_config_dhcp6_find_device(dev->name);
 	if ((merged = ni_sysconfig_merge_defaults(sc, __ni_suse_dhcp_defaults))) {
-		__ni_suse_addrconf_dhcp6_options(merged, compat);
+		__ni_suse_addrconf_dhcp6_options(merged, compat, config);
 		ni_sysconfig_destroy(merged);
 	}
 
@@ -4830,10 +4977,22 @@ __ni_suse_addrconf_auto6(const ni_sysconfig_t *sc, ni_compat_netdev_t *compat)
 	}
 
 	compat->auto6.enabled = TRUE;
-	compat->auto6.defer_timeout = -1U; /* use a built-in default */
+	compat->auto6.defer_timeout = -1U; /* use a built-in timeout by default */
 	if ((merged = ni_sysconfig_merge_defaults(sc, __ni_suse_config_defaults))) {
+		const char *value;
+
 		ni_sysconfig_get_integer(merged, "AUTO6_WAIT_AT_BOOT",
-				&compat->auto6.defer_timeout);
+					&compat->auto6.defer_timeout);
+
+		if ((value = ni_sysconfig_get_value(merged, "AUTO6_UPDATE"))) {
+			unsigned int temp = __NI_ADDRCONF_UPDATE_NONE;
+
+			if (ni_addrconf_update_flags_parse(&temp, value, " \t"))
+				compat->auto6.update &= temp;
+			else
+				ni_warn("ifcfg-%s: unknown flags in AUTO6_UPDATE='%s'",
+					dev->name, value);
+		}
 		ni_sysconfig_destroy(merged);
 	}
 	return TRUE;

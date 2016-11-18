@@ -97,6 +97,8 @@ typedef struct ni_dhcp4_user_class {
 	ni_string_array_t               class_id;
 } ni_dhcp4_user_class_t;
 
+typedef struct ni_dhcp_option		ni_dhcp_option_t;
+
 typedef struct ni_addrconf_updater	ni_addrconf_updater_t;
 
 struct ni_addrconf_lease {
@@ -149,6 +151,7 @@ struct ni_addrconf_lease {
 		ni_opaque_t		client_id;
 		struct in_addr		server_id;
 		struct in_addr		relay_addr;
+		char *			sender_hwa;
 
 		struct in_addr		address;
 		struct in_addr		netmask;
@@ -164,6 +167,8 @@ struct ni_addrconf_lease {
 		char *			boot_file;
 		char *			root_path;
 		char *			message;
+
+		ni_dhcp_option_t *	options;
 	    } dhcp4;
 	    struct ni_addrconf_lease_dhcp6 {
 		ni_opaque_t		client_id;
@@ -175,6 +180,8 @@ struct ni_addrconf_lease {
 		struct ni_dhcp6_ia *	ia_list;
 		char *			boot_url;
 		ni_string_array_t	boot_params;
+
+		ni_dhcp_option_t *	options;
 	    } dhcp6;
 	};
 };
@@ -199,10 +206,11 @@ ni_addrconf_lease_is_valid(const ni_addrconf_lease_t *lease)
 
 extern int		ni_addrconf_lease_file_write(const char *, ni_addrconf_lease_t *);
 extern ni_addrconf_lease_t *ni_addrconf_lease_file_read(const char *, int, int);
+extern ni_bool_t	ni_addrconf_lease_file_exists(const char *, int, int);
 extern void		ni_addrconf_lease_file_remove(const char *, int, int);
 
-extern int		ni_addrconf_lease_to_xml(const ni_addrconf_lease_t *, xml_node_t **);
-extern int		ni_addrconf_lease_from_xml(ni_addrconf_lease_t **, const xml_node_t *);
+extern int		ni_addrconf_lease_to_xml(const ni_addrconf_lease_t *, xml_node_t **, const char *);
+extern int		ni_addrconf_lease_from_xml(ni_addrconf_lease_t **, const xml_node_t *, const char *);
 
 extern int		ni_addrconf_name_to_type(const char *);
 extern const char *	ni_addrconf_type_to_name(unsigned int);
@@ -219,6 +227,7 @@ extern const char *	ni_addrconf_flags_format(ni_stringbuf_t *, unsigned int, con
 extern const char *	ni_addrconf_update_flag_to_name(unsigned int);
 extern ni_bool_t	ni_addrconf_update_name_to_flag(const char *, unsigned int *);
 extern void		ni_addrconf_update_set(unsigned int *, unsigned int, ni_bool_t);
+extern ni_bool_t	ni_addrconf_update_flags_parse(unsigned int *, const char *, const char *);
 extern const char *	ni_addrconf_update_flags_format(ni_stringbuf_t *, unsigned int, const char *);
 
 extern const char *	ni_dhcp6_mode_type_to_name(unsigned int);

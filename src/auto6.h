@@ -30,13 +30,14 @@ typedef struct ni_auto6_request ni_auto6_request_t;
 struct ni_auto6_request {
 	ni_bool_t		enabled;
 	unsigned int		defer_timeout;
+	unsigned int		update;
 };
 
 extern void			ni_auto6_request_init(ni_auto6_request_t *);
 extern void			ni_auto6_request_destroy(ni_auto6_request_t *);
 
 extern int			ni_auto6_acquire(ni_netdev_t *, const ni_auto6_request_t *);
-extern int			ni_auto6_release(ni_netdev_t *);
+extern int			ni_auto6_release(ni_netdev_t *, ni_bool_t);
 
 
 extern void			ni_auto6_on_netdev_event(ni_netdev_t *, ni_event_t);

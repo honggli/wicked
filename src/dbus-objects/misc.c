@@ -31,10 +31,9 @@
 #include "misc.h"
 #include "model.h"
 #include "debug.h"
+#include "dhcp.h"
 
 static dbus_bool_t		__ni_objectmodel_callback_info_to_dict(const ni_objectmodel_callback_info_t *, ni_dbus_variant_t *);
-static dbus_bool_t		__ni_objectmodel_address_to_dict(const ni_address_t *, ni_dbus_variant_t *);
-static ni_address_t *		__ni_objectmodel_address_from_dict(ni_address_t **, const ni_dbus_variant_t *);
 static dbus_bool_t		__ni_objectmodel_route_to_dict(const ni_route_t *, ni_dbus_variant_t *);
 static ni_route_t *		__ni_objectmodel_route_from_dict(ni_route_table_t **, const ni_dbus_variant_t *);
 static dbus_bool_t		ni_objectmodel_rule_to_dict(const ni_rule_t *, ni_dbus_variant_t *);
@@ -439,10 +438,12 @@ __ni_objectmodel_set_address_list(ni_address_t **list,
 {
 	unsigned int i;
 
-	if (!ni_dbus_variant_is_dict_array(argument)) {
-		dbus_set_error(error, DBUS_ERROR_INVALID_ARGS,
-				"%s: argument type mismatch",
-				__FUNCTION__);
+	if (!list || !argument || !ni_dbus_variant_is_dict_array(argument)) {
+		if (error) {
+			dbus_set_error(error, DBUS_ERROR_INVALID_ARGS,
+					"%s: argument type mismatch",
+					__FUNCTION__);
+		}
 		return FALSE;
 	}
 
@@ -576,6 +577,7 @@ __ni_objectmodel_address_to_dict(const ni_address_t *ap, ni_dbus_variant_t *dict
 	if (ap->bcast_addr.ss_family == ap->family)
 		__ni_objectmodel_dict_add_sockaddr(dict, "broadcast", &ap->bcast_addr);
 
+	ni_dbus_dict_add_uint32(dict, "scope", ap->scope);
 	if (ap->flags)
 		ni_dbus_dict_add_uint32(dict, "flags", ap->flags);
 
@@ -605,6 +607,7 @@ __ni_objectmodel_address_from_dict(ni_address_t **list, const ni_dbus_variant_t 
 	ni_address_t *ap = NULL;
 	ni_sockaddr_t local_addr;
 	unsigned int prefixlen;
+	uint32_t scope;
 
 	if (__ni_objectmodel_dict_get_sockaddr_prefix(dict, "local", &local_addr, &prefixlen)) {
 		const ni_dbus_variant_t *var;
@@ -617,6 +620,9 @@ __ni_objectmodel_address_from_dict(ni_address_t **list, const ni_dbus_variant_t 
 		__ni_objectmodel_dict_get_sockaddr(dict, "peer", &ap->peer_addr);
 		__ni_objectmodel_dict_get_sockaddr(dict, "anycast", &ap->anycast_addr);
 		__ni_objectmodel_dict_get_sockaddr(dict, "broadcast", &ap->bcast_addr);
+
+		if (ni_dbus_dict_get_uint32(dict, "scope", &scope) && scope <= RT_SCOPE_NOWHERE)
+			ap->scope = scope;
 
 		/* Do we need to translate them and map to names?
 		 * The usable flags differ between address families and
@@ -648,7 +654,8 @@ __ni_objectmodel_address_from_dict(ni_address_t **list, const ni_dbus_variant_t 
 				ap->owner = NI_ADDRCONF_NONE;
 		}
 
-		ni_address_list_append(list, ap);
+		if (list)
+			ni_address_list_append(list, ap);
 	}
 
 	return ap;
@@ -1525,6 +1532,73 @@ ni_objectmodel_rule_from_dict(ni_rule_t *rule, const ni_dbus_variant_t *dict)
  * Build a DBus dict from an addrconf lease
  */
 static void
+__ni_objectmodel_get_addrconf_dhcp_opts_dict(const ni_dhcp_option_t *options,
+					ni_dbus_variant_t *dict,
+					unsigned int minlen, unsigned int maxlen)
+{
+	ni_dbus_variant_t *array;
+	const ni_dhcp_option_t *opt;
+
+	if (!options || !dict || !(array = ni_dbus_dict_add(dict, "options")))
+		return;
+
+	ni_dbus_dict_array_init(array);
+	for (opt = options; opt; opt = opt->next) {
+		if (!opt->code || opt->len < minlen || maxlen < opt->len)
+			continue;
+
+		if (!(dict = ni_dbus_dict_array_add(array)))
+			continue;
+
+		ni_dbus_variant_init_dict(dict);
+		ni_dbus_dict_add_uint16(dict, "code", opt->code);
+		if (!opt->len)
+			continue;
+		ni_dbus_dict_add_byte_array(dict, "data", opt->data, opt->len);
+	}
+}
+
+static void
+__ni_objectmodel_set_addrconf_dhcp_opts_dict(ni_dhcp_option_t **options,
+					const ni_dbus_variant_t *dict,
+					unsigned int minlen, unsigned int maxlen)
+{
+	const ni_dbus_variant_t *array, *var;
+	ni_dhcp_option_t *opt;
+	unsigned int i;
+
+	ni_dhcp_option_list_destroy(options);
+	if (!dict || !(array = ni_dbus_dict_get(dict, "options")))
+		return;
+
+	if (!ni_dbus_variant_is_dict_array(array))
+		return;
+
+	for (i = 0; i < array->array.len; ++i) {
+		uint16_t code;
+
+		dict = &array->variant_array_value[i];
+		if (!ni_dbus_variant_is_dict(dict))
+			continue;
+
+		if (!ni_dbus_dict_get_uint16(dict, "code", &code) || !code)
+			continue;
+
+		if (!(var = ni_dbus_dict_get(dict, "data")))
+			continue;
+		if (!ni_dbus_variant_is_byte_array(var))
+			continue;
+
+		if (var->array.len < minlen || maxlen < var->array.len)
+			continue;
+
+		opt = ni_dhcp_option_new(code, var->array.len, var->byte_array_value);
+		if (!ni_dhcp_option_list_append(options, opt))
+			ni_dhcp_option_free(opt);
+	}
+}
+
+static void
 __ni_objectmodel_get_addrconf_dhcp4_dict(const struct ni_addrconf_lease_dhcp4 *dhcp4,
 					ni_dbus_variant_t *dict)
 {
@@ -1539,6 +1613,10 @@ __ni_objectmodel_get_addrconf_dhcp4_dict(const struct ni_addrconf_lease_dhcp4 *d
 	if (dhcp4->relay_addr.s_addr) {
 		ni_dbus_dict_add_string(dict, "relay-address",
 				inet_ntoa(dhcp4->relay_addr));
+	}
+	if (dhcp4->sender_hwa) {
+		ni_dbus_dict_add_string(dict, "sender-hw-address",
+				dhcp4->sender_hwa);
 	}
 	if (dhcp4->mtu) {
 		ni_dbus_dict_add_uint16(dict, "mtu", dhcp4->mtu);
@@ -1572,6 +1650,8 @@ __ni_objectmodel_get_addrconf_dhcp4_dict(const struct ni_addrconf_lease_dhcp4 *d
 		ni_dbus_dict_add_string(dict, "message",
 						dhcp4->message);
 	}
+
+	__ni_objectmodel_get_addrconf_dhcp_opts_dict(dhcp4->options, dict, 1, 65535);
 }
 
 static void
@@ -1609,6 +1689,8 @@ __ni_objectmodel_get_addrconf_dhcp6_dict(const struct ni_addrconf_lease_dhcp6 *d
 		__ni_objectmodel_set_string_array(dict, "bootfile-params",
 							&dhcp6->boot_params);
 	}
+
+	__ni_objectmodel_get_addrconf_dhcp_opts_dict(dhcp6->options, dict, 0, 65535);
 }
 
 dbus_bool_t
@@ -1756,6 +1838,8 @@ __ni_objectmodel_set_addrconf_dhcp4_data(struct ni_addrconf_lease_dhcp4 *dhcp4,
 			return FALSE;
 		dhcp4->relay_addr = addr.sin.sin_addr;
 	}
+	if (ni_dbus_dict_get_string(dict, "sender-hw-address", &string_value))
+		ni_string_dup(&dhcp4->sender_hwa, string_value);
 	if (ni_dbus_dict_get_uint16(dict, "mtu", &value16))
 		dhcp4->mtu = value16;
 	if (ni_dbus_dict_get_uint32(dict, "lease-time", &value32))
@@ -1777,6 +1861,8 @@ __ni_objectmodel_set_addrconf_dhcp4_data(struct ni_addrconf_lease_dhcp4 *dhcp4,
 		ni_string_dup(&dhcp4->root_path, string_value);
 	if (__ni_objectmodel_get_printable_string(dict, "message", &string_value))
 		ni_string_dup(&dhcp4->message, string_value);
+
+	__ni_objectmodel_set_addrconf_dhcp_opts_dict(&dhcp4->options, dict, 1, 65536);
 
 	return TRUE;
 }
@@ -1826,6 +1912,8 @@ __ni_objectmodel_set_addrconf_dhcp6_data(struct ni_addrconf_lease_dhcp6 *dhcp6,
 	 && !__ni_objectmodel_get_printable_array(&dhcp6->boot_params, var,
 						error, "bootfile-params"))
 		return FALSE;
+
+	__ni_objectmodel_set_addrconf_dhcp_opts_dict(&dhcp6->options, dict, 0, 65535);
 
 	return TRUE;
 }

@@ -118,7 +118,12 @@ extern int		ni_string_array_cmp(const ni_string_array_t *, const ni_string_array
 extern void		ni_uint_array_init(ni_uint_array_t *);
 extern void		ni_uint_array_destroy(ni_uint_array_t *);
 extern ni_bool_t	ni_uint_array_append(ni_uint_array_t *, unsigned int);
+extern ni_bool_t	ni_uint_array_remove(ni_uint_array_t *, unsigned int);
+extern ni_bool_t	ni_uint_array_remove_at(ni_uint_array_t *, unsigned int);
+extern unsigned int	ni_uint_array_index(ni_uint_array_t *, unsigned int);
 extern ni_bool_t	ni_uint_array_contains(ni_uint_array_t *, unsigned int);
+extern ni_bool_t	ni_uint_array_get(ni_uint_array_t *, unsigned int, unsigned int *);
+extern ni_bool_t	ni_uint_array_set(ni_uint_array_t *, unsigned int, unsigned int);
 
 extern ni_var_array_t *	ni_var_array_new(void);
 extern void		ni_var_array_free(ni_var_array_t *);
@@ -232,6 +237,8 @@ extern char *		ni_unquote(const char **stringp, const char *sepa);
 extern void		ni_srandom(void);
 
 extern ni_bool_t	ni_try_mlock(const void *, size_t);
+
+extern ni_bool_t	ni_uint_in_range(const ni_uint_range_t *, const unsigned int);
 
 /* Use this in mainloop-like functions to check at defined execution points
  * whether we were signaled in the meantime.

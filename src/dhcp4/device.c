@@ -22,14 +22,15 @@
 #include "netinfo_priv.h"
 #include "appconfig.h"
 
-#include "dhcp4/dhcp.h"
+#include "dhcp4/dhcp4.h"
 #include "dhcp4/protocol.h"
+#include "dhcp.h"
 
 
 static unsigned int	ni_dhcp4_do_bits(unsigned int);
 static const char *	__ni_dhcp4_print_doflags(unsigned int);
+static void		ni_dhcp4_config_set_request_options(const char *, ni_uint_array_t *, const ni_string_array_t *);
 
-static uint32_t ni_dhcp4_xid;
 ni_dhcp4_device_t *	ni_dhcp4_active;
 
 /*
@@ -113,9 +114,11 @@ ni_dhcp4_device_stop(ni_dhcp4_device_t *dev)
 void
 ni_dhcp4_device_set_config(ni_dhcp4_device_t *dev, ni_dhcp4_config_t *config)
 {
-	if (dev->config && dev->config->user_class.class_id.count)
+	if (dev->config) {
 		ni_string_array_destroy(&dev->config->user_class.class_id);
-	free(dev->config);
+		ni_uint_array_destroy(&dev->config->request_options);
+		free(dev->config);
+	}
 	dev->config = config;
 }
 
@@ -333,6 +336,7 @@ ni_dhcp4_acquire(ni_dhcp4_device_t *dev, const ni_dhcp4_request_t *info)
 		ni_trace("  recover_lease   %s", config->recover_lease ? "true" : "false");
 		ni_trace("  release_lease   %s", config->release_lease ? "true" : "false");
 	}
+	ni_dhcp4_config_set_request_options(dev->ifname, &config->request_options, &info->request_options);
 
 	ni_dhcp4_device_set_config(dev, config);
 
@@ -442,40 +446,61 @@ __ni_dhcp4_print_doflags(unsigned int flags)
 /*
  * Process a request to unconfigure the device (ie drop the lease).
  */
-int
-ni_dhcp4_release(ni_dhcp4_device_t *dev, const ni_uuid_t *lease_uuid)
+static void
+ni_dhcp4_start_release(void *user_data, const ni_timer_t *timer)
 {
-	char *rel_uuid = NULL;
-	char *our_uuid = NULL;
+	ni_dhcp4_device_t *dev = user_data;
 
-	if (dev->lease == NULL) {
-		ni_error("%s: no lease set", dev->ifname);
-		return -NI_ERROR_ADDRCONF_NO_LEASE;
-	}
-
-	ni_string_dup(&rel_uuid, ni_uuid_print(lease_uuid));
-	ni_string_dup(&our_uuid, ni_uuid_print(&dev->lease->uuid));
-	if (lease_uuid && !ni_uuid_equal(lease_uuid, &dev->lease->uuid)) {
-		ni_warn("%s: lease UUID %s to release does not match current lease UUID %s",
-			dev->ifname, rel_uuid, our_uuid);
-		ni_string_free(&rel_uuid);
-		ni_string_free(&our_uuid);
-		return -NI_ERROR_ADDRCONF_NO_LEASE;
-	}
-	ni_string_free(&our_uuid);
-
-	ni_note("%s: Request to release DHCPv4 lease%s%s",  dev->ifname,
-		rel_uuid ? " with UUID " : "", rel_uuid ? rel_uuid : "");
-	ni_string_free(&rel_uuid);
+	if (dev->defer.timer != timer)
+		return;
+	dev->defer.timer = NULL;
 
 	/* We just send out a singe RELEASE without waiting for the
 	 * server's reply. We just keep our fingers crossed that it's
 	 * getting out. If it doesn't, it's rather likely the network
 	 * is hosed anyway, so there's little point in delaying. */
-	ni_dhcp4_fsm_release(dev);
+	ni_dhcp4_fsm_release_init(dev);
 
 	ni_dhcp4_device_stop(dev);
-	return 0;
+}
+
+int
+ni_dhcp4_release(ni_dhcp4_device_t *dev, const ni_uuid_t *req_uuid)
+{
+	char *rel_uuid = NULL;
+
+	ni_string_dup(&rel_uuid, ni_uuid_print(req_uuid));
+	if (dev->lease == NULL || dev->config == NULL) {
+		ni_info("%s: Request to release DHCPv4 lease%s%s: no lease",
+			dev->ifname,
+			rel_uuid ? " with UUID " : "", rel_uuid ? rel_uuid : "");
+
+		ni_string_free(&rel_uuid);
+		ni_dhcp4_device_drop_lease(dev);
+		ni_dhcp4_device_stop(dev);
+		return -NI_ERROR_ADDRCONF_NO_LEASE;
+	}
+
+	ni_note("%s: Request to release DHCPv4 lease%s%s: releasing...",
+		dev->ifname,
+		rel_uuid ? " with UUID " : "", rel_uuid ? rel_uuid : "");
+	ni_string_free(&rel_uuid);
+
+	dev->lease->uuid = *req_uuid;
+	dev->config->uuid = *req_uuid;
+	dev->fsm.state = NI_DHCP4_STATE_INIT;
+	ni_dhcp4_device_disarm_retransmit(dev);
+	if (dev->fsm.timer) {
+		ni_timer_cancel(dev->fsm.timer);
+		dev->fsm.timer = NULL;
+	}
+	ni_dhcp4_device_drop_best_offer(dev);
+	ni_dhcp4_device_arp_close(dev);
+
+	if (dev->defer.timer)
+		ni_timer_cancel(dev->defer.timer);
+	dev->defer.timer = ni_timer_register(0, ni_dhcp4_start_release, dev);
+	return 1;
 }
 
 /*
@@ -546,14 +571,17 @@ ni_dhcp4_device_start(ni_dhcp4_device_t *dev)
 	nc = ni_global_state_handle(0);
 	if(!nc || !(ifp = ni_netdev_by_index(nc, dev->link.ifindex))) {
 		ni_error("%s: unable to start device", dev->ifname);
+		ni_dhcp4_device_stop(dev);
 		return -1;
 	}
 
 	/* Reuse defer pointer for this one-shot timer */
 	msec = ni_timeout_randomize(msec, &jitter);
+	if (dev->defer.timer)
+		ni_timer_cancel(dev->defer.timer);
 	dev->defer.timer = ni_timer_register(msec, ni_dhcp4_device_start_delayed, dev);
 
-	return !ni_netdev_link_is_up(ifp);
+	return 1;
 }
 
 void
@@ -602,20 +630,17 @@ ni_dhcp4_device_send_message(ni_dhcp4_device_t *dev, unsigned int msg_code, cons
 	ni_timeout_param_t timeout;
 	int rv;
 
-	/* Assign a new XID to this message */
-	if (ni_dhcp4_xid == 0)
-		ni_dhcp4_xid = random();
-	dev->dhcp4.xid = ni_dhcp4_xid++;
-
 	dev->transmit.msg_code = msg_code;
 	dev->transmit.lease = lease;
 
 	if (ni_dhcp4_socket_open(dev) < 0) {
-		ni_error("unable to open capture socket");
+		ni_error("%s: unable to open capture socket", dev->ifname);
 		goto transient_failure;
 	}
 
-	ni_debug_dhcp("sending %s with xid 0x%x", ni_dhcp4_message_name(msg_code), htonl(dev->dhcp4.xid));
+	ni_debug_dhcp("%s: sending %s with xid 0x%x in state %s", dev->ifname,
+			ni_dhcp4_message_name(msg_code), htonl(dev->dhcp4.xid),
+			ni_dhcp4_fsm_state_name(dev->fsm.state));
 
 	if ((rv = ni_dhcp4_device_prepare_message(dev)) < 0)
 		return -1;
@@ -666,11 +691,6 @@ ni_dhcp4_device_send_message_unicast(ni_dhcp4_device_t *dev, unsigned int msg_co
 		.sin_addr.s_addr = lease->dhcp4.server_id.s_addr,
 		.sin_port = htons(DHCP4_SERVER_PORT),
 	};
-
-	/* Assign a new XID to this message */
-	if (ni_dhcp4_xid == 0)
-		ni_dhcp4_xid = random();
-	dev->dhcp4.xid = ni_dhcp4_xid++;
 
 	dev->transmit.msg_code = msg_code;
 	dev->transmit.lease = lease;
@@ -778,10 +798,9 @@ ni_dhcp4_config_vendor_class(void)
 }
 
 int
-ni_dhcp4_config_ignore_server(struct in_addr addr)
+ni_dhcp4_config_ignore_server(const char *name)
 {
 	const struct ni_config_dhcp4 *dhconf = &ni_global.config->addrconf.dhcp4;
-	const char *name = inet_ntoa(addr);
 
 	return (ni_string_array_index(&dhconf->ignore_servers, name) >= 0);
 }
@@ -794,7 +813,7 @@ ni_dhcp4_config_have_server_preference(void)
 }
 
 int
-ni_dhcp4_config_server_preference(struct in_addr addr)
+ni_dhcp4_config_server_preference_ipaddr(struct in_addr addr)
 {
 	const struct ni_config_dhcp4 *dhconf = &ni_global.config->addrconf.dhcp4;
 	const ni_server_preference_t *pref = dhconf->preferred_server;
@@ -809,10 +828,60 @@ ni_dhcp4_config_server_preference(struct in_addr addr)
 	return 0;
 }
 
+int
+ni_dhcp4_config_server_preference_hwaddr(const ni_hwaddr_t *hwaddr)
+{
+	const struct ni_config_dhcp4 *dhconf = &ni_global.config->addrconf.dhcp4;
+	const ni_server_preference_t *pref = dhconf->preferred_server;
+	unsigned int i;
+
+	if (!hwaddr || !hwaddr->len)
+		return 0;
+
+	for (i = 0; i < dhconf->num_preferred_servers; ++i, ++pref) {
+		if (pref->serverid.len != (size_t)hwaddr->len + 1)
+			continue;
+		if ((unsigned short)pref->serverid.data[0] != hwaddr->type)
+			continue;
+		if (memcmp(&pref->serverid.data[1], hwaddr->data, hwaddr->len))
+			continue;
+		return pref->weight;
+	}
+	return 0;
+}
+
 unsigned int
 ni_dhcp4_config_max_lease_time(void)
 {
 	return ni_global.config->addrconf.dhcp4.lease_time;
+}
+
+static void
+ni_dhcp4_config_set_request_options(const char *ifname, ni_uint_array_t *cfg, const ni_string_array_t *req)
+{
+	const ni_config_dhcp4_t *dhconf = ni_config_dhcp4_find_device(ifname);
+	const ni_dhcp_option_decl_t *custom_options = dhconf ? dhconf->custom_options : NULL;
+	unsigned int i, n;
+
+	for (n = i = 0; i < req->count; ++i) {
+		const char *opt = req->data[i];
+		const ni_dhcp_option_decl_t *decl;
+		unsigned int code;
+
+		if ((decl = ni_dhcp_option_decl_list_find_by_name(custom_options, opt)))
+			code = decl->code;
+		else if (ni_parse_uint(opt, &code, 10) < 0)
+			continue;
+
+		if (!code || code >= 255)
+			continue;
+
+		if (!ni_uint_array_contains(cfg, code)) {
+			ni_debug_dhcp("  request-option[%u]: %u %s", n++, code,
+							decl ? decl->name : "");
+			ni_uint_array_append(cfg, code);
+		}
+	}
 }
 
 /*
@@ -839,6 +908,7 @@ ni_dhcp4_request_free(ni_dhcp4_request_t *req)
 	ni_string_free(&req->clientid);
 	ni_string_free(&req->vendor_class);
 	ni_string_array_destroy(&req->user_class.class_id);
+	ni_string_array_destroy(&req->request_options);
 	free(req);
 }
 
@@ -885,3 +955,27 @@ ni_dhcp4_supported(const ni_netdev_t *ifp)
 	return TRUE;
 }
 
+void
+ni_dhcp4_new_xid(ni_dhcp4_device_t *cur)
+{
+	ni_dhcp4_device_t *dev;
+	unsigned int xid;
+
+	if (!cur)
+		return;
+
+	do {
+		do {
+			xid = random();
+		} while (!xid);
+
+		for (dev = ni_dhcp4_active; dev; dev = dev->next) {
+			if (xid == dev->dhcp4.xid) {
+				xid = 0;
+				break;
+			}
+		}
+	} while (!xid);
+
+	cur->dhcp4.xid = xid;
+}

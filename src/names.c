@@ -77,6 +77,7 @@ static const ni_intmap_t	__linktype_names[] = {
 	{ "team",		NI_IFTYPE_TEAM },
 	{ "ovs-system",		NI_IFTYPE_OVS_SYSTEM },
 	{ "ovs-bridge",		NI_IFTYPE_OVS_BRIDGE },
+	{ "ovs",		NI_IFTYPE_OVS_UNSPEC },
 
 	{ NULL }
 };
@@ -114,6 +115,7 @@ static const ni_intmap_t	__linkinfo_kind_names[] = {
 	{ "sit",		NI_IFTYPE_SIT },
 	{ "ipip",		NI_IFTYPE_IPIP },
 	{ "gre",		NI_IFTYPE_GRE },
+	{ "openvswitch",	NI_IFTYPE_OVS_UNSPEC }, /* new in 4.4 kernels */
 
 	{ NULL }
 };
@@ -285,6 +287,37 @@ ni_addrconf_update_set(unsigned int *mask, unsigned int flag, ni_bool_t enable)
 		else
 			*mask &= ~(1 << flag);
 	}
+}
+
+ni_bool_t
+ni_addrconf_update_flags_parse(unsigned int *flags, const char *value, const char *sep)
+{
+	ni_string_array_t list = NI_STRING_ARRAY_INIT;
+	unsigned int flag, i;
+	ni_bool_t ret = TRUE;
+
+	if (!flags || !value || ni_string_empty(sep))
+		return FALSE;
+
+	if (ni_string_empty(value) || ni_string_eq(value, "none")) {
+		*flags = __NI_ADDRCONF_UPDATE_NONE;
+		return TRUE;
+	}
+	if (ni_string_eq(value, "all")) {
+		*flags = -1U;
+		return TRUE;
+	}
+
+	*flags = __NI_ADDRCONF_UPDATE_NONE;
+	ni_string_split(&list, value, sep, 0);
+	for (i = 0; ret && i < list.count; ++i) {
+		if (ni_addrconf_update_name_to_flag(list.data[i], &flag))
+			ni_addrconf_update_set(flags, flag, TRUE);
+		else
+			ret = FALSE;
+	}
+	ni_string_array_destroy(&list);
+	return ret;
 }
 
 const char *

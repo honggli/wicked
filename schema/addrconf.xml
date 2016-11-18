@@ -198,6 +198,8 @@
     <update type="builtin-addrconf-update-mask" />
     <hostname type="string" />
     <route-priority type="uint32" />
+
+    <request-options class="array" element-type="string" element-name="option" />
   </define>
   <define name="properties" type="interface:addrconf-lease"/>
 
@@ -245,6 +247,7 @@
     <update type="builtin-addrconf-update-mask" />
     <hostname type="string" />
 
+    <request-options class="array" element-type="string" element-name="option" />
   </define>
   <define name="properties" type="interface:addrconf-lease"/>
 
@@ -302,6 +305,7 @@
   <define name="request" class="dict">
     <enabled type="boolean"/>
     <defer-timeout type="uint32" />
+    <update type="builtin-addrconf-update-mask" />
   </define>
   <define name="properties" type="interface:addrconf-lease"/>
 
